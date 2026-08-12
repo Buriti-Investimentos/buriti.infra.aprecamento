@@ -1,0 +1,38 @@
+# Copie para environments/dev.tfvars ou prod.tfvars e preencha.
+# NÃO commitar os .tfvars reais (já estão no .gitignore).
+subscription_id = "00000000-0000-0000-0000-000000000000"
+environment     = "dev"
+location        = "brazilsouth"
+
+# Reusar o ACR do funds-api (recomendado) — deixe vazio para criar um novo.
+acr_name                = ""
+acr_resource_group_name = ""
+
+# Imagem publicada pelo CI. UMA imagem serve as 2 Function Apps.
+image_name = "buriti-aprecamento"
+image_tag  = "latest"
+
+# Compute. EP1 é obrigatório enquanto a conexão usar pyodbc/ODBC 18 (pacote de
+# sistema → exige container próprio) e/ou o SQL estiver atrás de VNet.
+functions_sku         = "EP1"
+functions_max_workers = 20
+calc_scale_limit      = 10
+
+# Agenda do lote diário — NCRONTAB de SEIS campos (segundos na frente!).
+# "0 0 21 * * *" = 21h em ponto. Cron de 5 campos dispara na hora errada.
+cron_expression = "0 0 21 * * *"
+
+# Banco (pedir ao Felipe).
+sql_server_host  = "servidor.database.windows.net"
+sql_server_db    = "BURITI_DW"
+calc_pool_size   = 5
+sql_auth_enabled = false
+
+# Rede: vazio = SQL público com firewall. Preencher só se for private endpoint
+# (subnet DELEGADA a Microsoft.Web/serverFarms).
+functions_subnet_id = ""
+
+# Alertas: lista VAZIA desliga todos os alertas.
+alert_emails         = []
+alert_quarantine_max = 20
+max_dequeue_count    = 5

@@ -1,0 +1,259 @@
+# Compute do batch — 2 Container App Jobs (daily cron + backfill on-demand).
+#
+# Decisão (doc 12 §5.3): Container App JOB — event/schedule-driven, liga só na
+# janela do batch (custo), teto DURO de concorrência (parallelism × CALC_POOL_SIZE)
+# para NÃO estourar as conexões do SQL compartilhado.
+#
+# NI mensal (ni_job): NÃO tem job separado — roda no INÍCIO do daily_job (o NI do
+# mês precisa existir antes da curva IPCA+; doc 12 §2.6). Execução isolada, se
+# precisar: reusar o job de backfill com command override no start.
+# Simulação (simulate.py): idem — reusa o job de backfill com command override
+# (doc 12 §5.3); sem recurso Terraform novo.
+
+resource "azurerm_container_app_environment" "this" {
+  name                       = "cae-${local.name}"
+  resource_group_name        = azurerm_resource_group.this.name
+  location                   = azurerm_resource_group.this.location
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.this.id
+  tags                       = local.tags
+
+  # Rede até o SQL (doc 12 §5.1 — pendência Felipe): cenário (a) endpoint
+  # público + firewall → deixar a var vazia (nada a criar aqui); cenário (b)
+  # VNet/private endpoint → Felipe fornece a subnet delegada e ela entra aqui.
+  infrastructure_subnet_id = var.sql_private_endpoint_subnet_id != "" ? var.sql_private_endpoint_subnet_id : null
+}
+
+# Secret refs do Key Vault (doc 12 §5.2): o Terraform grava só a REFERÊNCIA
+# (URI versionless) — os VALORES entram fora do TF (az keyvault secret set,
+# ver README §Secrets) para nunca vazarem no state. Só existem em dev
+# (sql_auth_enabled); em prod a autenticação é AAD via managed identity, sem senha.
+locals {
+  # vault_uri já termina com "/"
+  kv_secret_uri = {
+    sql-server-user = "${azurerm_key_vault.this.vault_uri}secrets/sql-server-user"
+    sql-server-pwd  = "${azurerm_key_vault.this.vault_uri}secrets/sql-server-pwd"
+  }
+  # env name → nome do secret no Container App Job
+  sql_auth_env = var.sql_auth_enabled ? {
+    SQL_SERVER_USER = "sql-server-user"
+    SQL_SERVER_PWD  = "sql-server-pwd"
+  } : {}
+}
+
+# --- Job 1: batch diário (cron) ---
+resource "azurerm_container_app_job" "aprecamento" {
+  name                         = "caj-${local.name}-daily"
+  resource_group_name          = azurerm_resource_group.this.name
+  location                     = azurerm_resource_group.this.location
+  container_app_environment_id = azurerm_container_app_environment.this.id
+
+  replica_timeout_in_seconds = 3600 # janela do lote; ajustar após medir o tier do SQL
+  replica_retry_limit        = 1    # re-roda o job inteiro — barato, é idempotente (doc 12 §2.8)
+
+  # Agenda diária (após o ETL de posições/índices). O cron é só o despertador:
+  # a dependência real é o watermark (doc 12 §2.2). Concorrência é TETO DURO:
+  # parallelism controla réplicas simultâneas; o pool de workers dentro do
+  # container multiplexa N ativos por conexão — nunca 1 conexão por cálculo.
+  schedule_trigger_config {
+    cron_expression          = var.cron_expression
+    parallelism              = 1
+    replica_completion_count = 1
+  }
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.this.id]
+  }
+
+  registry {
+    server   = local.acr_login_server
+    identity = azurerm_user_assigned_identity.this.id
+  }
+
+  # Credenciais SQL de dev via Key Vault (vazio em prod — AAD).
+  dynamic "secret" {
+    for_each = var.sql_auth_enabled ? local.kv_secret_uri : {}
+    content {
+      name                = secret.key
+      identity            = azurerm_user_assigned_identity.this.id
+      key_vault_secret_id = secret.value
+    }
+  }
+
+  template {
+    container {
+      name  = "aprecamento"
+      image = "${local.acr_login_server}/${var.image_name}:${var.image_tag}"
+      # Entrypoint explícito (o CMD do Dockerfile ainda é placeholder);
+      # o daily roda o ni_job internamente antes da curva (doc 12 §2.6).
+      command = ["python", "-m", "src.service.daily_job"]
+      cpu     = var.job_cpu
+      memory  = var.job_memory
+
+      env {
+        name  = "APP_ENV"
+        value = var.environment
+      }
+      env {
+        name  = "TZ"
+        value = var.timezone
+      }
+      env {
+        name  = "APPLICATIONINSIGHTS_CONNECTION_STRING"
+        value = azurerm_application_insights.this.connection_string
+      }
+      env {
+        name  = "AZURE_CLIENT_ID"
+        value = azurerm_user_assigned_identity.this.client_id
+      }
+      # Conexão do banco: host/porta/db NÃO são segredo (doc 12 §2.1);
+      # user/pwd (só dev) vêm do Key Vault via secret ref abaixo.
+      env {
+        name  = "SQL_SERVER_HOST"
+        value = var.sql_server_host
+      }
+      env {
+        name  = "SQL_SERVER_PORT"
+        value = tostring(var.sql_server_port)
+      }
+      env {
+        name  = "SQL_SERVER_DB"
+        value = var.sql_server_db
+      }
+      # Lote: teto de conexões no banco = parallelism × CALC_POOL_SIZE (doc 12 §2.1).
+      env {
+        name  = "CALC_POOL_SIZE"
+        value = tostring(var.calc_pool_size)
+      }
+      dynamic "env" {
+        for_each = local.sql_auth_env
+        content {
+          name        = env.key
+          secret_name = env.value
+        }
+      }
+    }
+  }
+
+  tags = local.tags
+
+  # A role de pull no ACR e a de leitura no KV precisam existir antes do job
+  # tentar puxar imagem/resolver secret ref no primeiro provisionamento.
+  depends_on = [
+    azurerm_role_assignment.acr_pull,
+    azurerm_role_assignment.kv_secrets_user,
+  ]
+
+  lifecycle {
+    # O CI atualiza a tag da imagem; evita rollback acidental no apply (bug visto no OCR).
+    ignore_changes = [template[0].container[0].image]
+  }
+}
+
+# --- Job 2: backfill/retroativo (on-demand, NUNCA no cron — doc 12 §2.3/§5.3) ---
+# Disparo: az containerapp job start (ver README §Backfill), com override de
+# BACKFILL_ARGS (--fundo/--ativo/--de/--ate/--chunk-dias/--pausa-ms) via --env-vars.
+resource "azurerm_container_app_job" "aprecamento_backfill" {
+  name                         = "caj-${local.name}-backfill"
+  resource_group_name          = azurerm_resource_group.this.name
+  location                     = azurerm_resource_group.this.location
+  container_app_environment_id = azurerm_container_app_environment.this.id
+
+  replica_timeout_in_seconds = var.backfill_replica_timeout
+  # Sem retry automático: backfill é retomável por construção (idempotente por
+  # (id_renda_fixa, data_referencia, versao_calculo)); o operador re-dispara.
+  replica_retry_limit = 0
+
+  manual_trigger_config {
+    # Teto de conexões = parallelism × CALC_POOL_SIZE. Só sobe depois que o
+    # Felipe medir o tier do SQL (F1) — o knob fica em tfvars, não em código.
+    parallelism              = var.backfill_parallelism
+    replica_completion_count = var.backfill_parallelism
+  }
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.this.id]
+  }
+
+  registry {
+    server   = local.acr_login_server
+    identity = azurerm_user_assigned_identity.this.id
+  }
+
+  dynamic "secret" {
+    for_each = var.sql_auth_enabled ? local.kv_secret_uri : {}
+    content {
+      name                = secret.key
+      identity            = azurerm_user_assigned_identity.this.id
+      key_vault_secret_id = secret.value
+    }
+  }
+
+  template {
+    container {
+      name    = "aprecamento-backfill"
+      image   = "${local.acr_login_server}/${var.image_name}:${var.image_tag}" # MESMA imagem do daily
+      command = ["python", "-m", "src.service.backfill_job"]
+      cpu     = var.backfill_job_cpu
+      memory  = var.backfill_job_memory
+
+      env {
+        name  = "APP_ENV"
+        value = var.environment
+      }
+      env {
+        name  = "TZ"
+        value = var.timezone
+      }
+      env {
+        name  = "APPLICATIONINSIGHTS_CONNECTION_STRING"
+        value = azurerm_application_insights.this.connection_string
+      }
+      env {
+        name  = "AZURE_CLIENT_ID"
+        value = azurerm_user_assigned_identity.this.client_id
+      }
+      env {
+        name  = "SQL_SERVER_HOST"
+        value = var.sql_server_host
+      }
+      env {
+        name  = "SQL_SERVER_PORT"
+        value = tostring(var.sql_server_port)
+      }
+      env {
+        name  = "SQL_SERVER_DB"
+        value = var.sql_server_db
+      }
+      env {
+        name  = "CALC_POOL_SIZE"
+        value = tostring(var.calc_pool_size)
+      }
+      # Args do driver de retroativo — vazio por padrão; sobrescrever no start:
+      # az containerapp job start ... --env-vars "BACKFILL_ARGS=--fundo X --de 2024-01-02 --ate 2026-06-30"
+      env {
+        name  = "BACKFILL_ARGS"
+        value = ""
+      }
+      dynamic "env" {
+        for_each = local.sql_auth_env
+        content {
+          name        = env.key
+          secret_name = env.value
+        }
+      }
+    }
+  }
+
+  tags = local.tags
+
+  depends_on = [
+    azurerm_role_assignment.acr_pull,
+    azurerm_role_assignment.kv_secrets_user,
+  ]
+
+  lifecycle {
+    ignore_changes = [template[0].container[0].image]
+  }
+}
