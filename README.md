@@ -186,8 +186,9 @@ sete informações, e **cinco delas vêm do Felipe**:
 | `sql_server_host` / `sql_server_db` | Felipe — é o mesmo banco que o ETL usa hoje |
 | `functions_subnet_id` | Felipe — **só se** o SQL estiver atrás de rede privada; senão deixe vazio |
 | `acr_name` / `acr_resource_group_name` | Jefferson — reusar o registry existente evita criar outro |
-| `acr_tenant_id` | Felipe — **só se** o ACR estiver em outro tenant; senão deixe vazio (padrão = tenant atual) |
-| `acr_tenant_subscription_id` | Felipe — **só se** o ACR estiver em outro tenant/subscription; senão deixe vazio (padrão = subscription atual) |
+| `acr_tenant_id` | Jefferson — **só se** o ACR estiver em outro tenant; senão deixe vazio (padrão = tenant atual) |
+| `acr_tenant_subscription_id` | Jefferson — **só se** o ACR estiver em outro tenant/subscription; senão deixe vazio (padrão = subscription atual) |
+| `acr_client_id` | Jefferson — **só se** `acr_tenant_id` for preenchido (ACR cross-tenant); senão deixe vazio |
 | `alert_emails` | vocês — **lista vazia não cria alerta nenhum** |
 
 > ⚠️ **Deixe `sql_auth_enabled = false` neste primeiro momento.** Ele liga
@@ -280,7 +281,9 @@ cálculo acontece e a escrita falha na última etapa.
 
 ---
 
-### Passo 6 · Segredos de dev — **só se for usar usuário e senha**
+### Passo 6 · Segredos — **sql-auth (dev) e acr-credentials (cross-tenant)**
+
+#### SQL (dev apenas)
 
 Em **produção não existe este passo**: a autenticação é AAD pela identidade
 gerenciada, sem senha nenhuma.
@@ -296,8 +299,6 @@ az keyvault secret set --vault-name <key_vault_name> \
   --name sql-server-pwd  --value '...'
 ```
 
-Quem executa precisa da role **Key Vault Secrets Officer** no cofre.
-
 **Só então** vire `sql_auth_enabled = true` no tfvars e rode `apply` de novo — é
 esse segundo apply que injeta nas Function Apps a *referência* aos segredos.
 
@@ -305,6 +306,20 @@ esse segundo apply que injeta nas Function Apps a *referência* aos segredos.
 > primeiro apply, a app é criada apontando para um segredo que não existe. A
 > referência não resolve, a variável de conexão chega vazia, e a app sobe sem
 > conseguir falar com o banco — com um erro que fala de conexão, não de cofre.
+
+#### ACR cross-tenant (se aplicável)
+
+Se `acr_tenant_id` foi preenchido (ACR em outro tenant), você precisa guardar o
+`client_secret` do Service Principal no cofre **depois do primeiro apply** (o
+Terraform cria o secret vazio, pronto para receber):
+
+```bash
+az keyvault secret set --vault-name <key_vault_name> \
+  --name acr-client-secret --value '<client_secret_do_SP>'
+```
+
+Quem executa **todos esses segredos** (sql-server-pwd, sql-server-user,
+acr-client-secret) precisa da role **Key Vault Secrets Officer** no cofre.
 
 ---
 

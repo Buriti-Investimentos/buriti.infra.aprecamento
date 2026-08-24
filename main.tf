@@ -100,3 +100,19 @@ resource "azurerm_role_assignment" "acr_pull" {
   role_definition_name = "AcrPull"
   principal_id         = azurerm_user_assigned_identity.this.principal_id
 }
+
+# ACR cross-tenant: credenciais no Key Vault (Client Secret não entra direto em variable por segurança).
+# Manual: az keyvault secret set --vault-name <kv-name> --name acr-client-secret --value '<secret>'
+resource "azurerm_key_vault_secret" "acr_client_id" {
+  count        = var.acr_tenant_id != "" ? 1 : 0
+  name         = "acr-client-id"
+  value        = var.acr_client_id
+  key_vault_id = azurerm_key_vault.this.id
+}
+
+resource "azurerm_role_assignment" "kv_acr_secret_reader" {
+  count                = var.acr_tenant_id != "" ? 1 : 0
+  scope                = azurerm_key_vault.this.id
+  role_definition_name = "Key Vault Secrets User"
+  principal_id         = azurerm_user_assigned_identity.this.principal_id
+}

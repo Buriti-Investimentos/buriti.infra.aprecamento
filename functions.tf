@@ -147,6 +147,13 @@ locals {
       "SQL_SERVER_PWD"  = "@Microsoft.KeyVault(SecretUri=${azurerm_key_vault.this.vault_uri}secrets/sql-server-pwd)"
     } : {}
   )
+
+  # Credenciais do registry para ACR cross-tenant
+  app_settings_acr_registry = var.acr_tenant_id != "" ? {
+    "DOCKER_REGISTRY_SERVER_USERNAME" = var.acr_client_id
+    "DOCKER_REGISTRY_SERVER_PASSWORD" = "@Microsoft.KeyVault(SecretUri=${azurerm_key_vault.this.vault_uri}secrets/acr-client-secret)"
+    "DOCKER_REGISTRY_SERVER_URL"      = "https://${local.acr_login_server}"
+  } : {}
 }
 
 # ---------------------------------------------------------------------------
@@ -175,8 +182,8 @@ resource "azurerm_linux_function_app" "io" {
     app_scale_limit                               = 1
     elastic_instance_minimum                      = 1
     vnet_route_all_enabled                        = var.functions_subnet_id != ""
-    container_registry_use_managed_identity       = true
-    container_registry_managed_identity_client_id = azurerm_user_assigned_identity.this.client_id
+    container_registry_use_managed_identity       = var.acr_tenant_id == "" ? true : false
+    container_registry_managed_identity_client_id = var.acr_tenant_id == "" ? azurerm_user_assigned_identity.this.client_id : null
 
     application_stack {
       docker {
@@ -187,7 +194,7 @@ resource "azurerm_linux_function_app" "io" {
     }
   }
 
-  app_settings = merge(local.app_settings_comuns, local.app_settings_sql, {
+  app_settings = merge(local.app_settings_comuns, local.app_settings_sql, local.app_settings_acr_registry, {
     # Cron do diario, lido pelo timer_trigger via "%CRON_DIARIO%".
     "CRON_DIARIO" = var.cron_expression
 
@@ -234,8 +241,8 @@ resource "azurerm_linux_function_app" "calc" {
 
   site_config {
     app_scale_limit                               = var.calc_scale_limit
-    container_registry_use_managed_identity       = true
-    container_registry_managed_identity_client_id = azurerm_user_assigned_identity.this.client_id
+    container_registry_use_managed_identity       = var.acr_tenant_id == "" ? true : false
+    container_registry_managed_identity_client_id = var.acr_tenant_id == "" ? azurerm_user_assigned_identity.this.client_id : null
 
     application_stack {
       docker {
@@ -248,7 +255,7 @@ resource "azurerm_linux_function_app" "calc" {
 
   # Note o que NAO esta aqui: SQL_SERVER_HOST, SQL_SERVER_DB, credencial nenhuma.
   # Mesmo um bug que tentasse abrir conexao nao teria para onde ir.
-  app_settings = merge(local.app_settings_comuns, {
+  app_settings = merge(local.app_settings_comuns, local.app_settings_acr_registry, {
     "AzureWebJobs.agendador.Disabled" = "true"
     "AzureWebJobs.leitor.Disabled"    = "true"
     "AzureWebJobs.gravador.Disabled"  = "true"
