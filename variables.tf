@@ -118,6 +118,18 @@ variable "acr_name" {
   default     = ""
 }
 
+variable "acr_tenant_subscripton_id" {
+  type        = string
+  description = "ID da subscription do tenant alternativo onde o ACR está localizado. Vazio = usa a subscription atual."
+  default     = ""
+}
+
+variable "acr_tenant_id" {
+  type        = string
+  description = "Tenant ID do outro Azure tenant onde o ACR está localizado. Vazio = usa o tenant atual."
+  default     = ""
+}
+
 
 # --- Functions (Pacote 12-R) ---
 variable "functions_sku" {

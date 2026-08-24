@@ -76,6 +76,28 @@ Custo: **~US$150/mês por ambiente** só do plano. Se a economia for prioritári
 a alternativa (Flex + trocar o driver, ~US$25/mês) existe — mas é decisão de
 produto, não default de engenharia.
 
+### ACR: localmente ou cross-tenant
+
+O Terraform pode criar um ACR novo ou reusar um existente. Se o ACR existente
+estiver no **mesmo tenant**, a autenticação é automática via Managed Identity
+(sem senha). Se estiver em **outro tenant**, você precisa fornecer credenciais
+manuais:
+
+| Cenário | `acr_name` | `acr_tenant_id` | O que acontece |
+|---|---|---|---|
+| **ACR novo** | vazio | vazio | Terraform cria um registry `Basic` novo no tenant atual |
+| **ACR existente, mesmo tenant** | preenchido | vazio (padrão) | Terraform busca o registry existente e atribui `AcrPull` via Managed Identity |
+| **ACR em outro tenant** | preenchido | preenchido | Terraform busca o registry, **sem role assignment** — você fornece `client_id`/`client_secret` manualmente para autenticar as Function Apps |
+
+**Cenários 1 e 2:** as Function Apps puxam a imagem usando a Managed Identity, sem
+segredo.
+
+**Cenário 3:** se o ACR estiver em outro tenant, o role assignment cross-tenant não
+funciona com Managed Identity nativa. Solução: você cria manualmente um Service
+Principal no tenant do ACR com `AcrPull`, e passa `client_id`/`client_secret` das
+Function Apps via `DOCKER_REGISTRY_SERVER_USERNAME`/`PASSWORD` nos app_settings.
+A ordem de subida (Passo 1) mostra onde informar essas credenciais.
+
 ---
 
 ## Ordem de subida
@@ -164,6 +186,8 @@ sete informações, e **cinco delas vêm do Felipe**:
 | `sql_server_host` / `sql_server_db` | Felipe — é o mesmo banco que o ETL usa hoje |
 | `functions_subnet_id` | Felipe — **só se** o SQL estiver atrás de rede privada; senão deixe vazio |
 | `acr_name` / `acr_resource_group_name` | Jefferson — reusar o registry existente evita criar outro |
+| `acr_tenant_id` | Felipe — **só se** o ACR estiver em outro tenant; senão deixe vazio (padrão = tenant atual) |
+| `acr_tenant_subscripton_id` | Felipe — **só se** o ACR estiver em outro tenant/subscription; senão deixe vazio (padrão = subscription atual) |
 | `alert_emails` | vocês — **lista vazia não cria alerta nenhum** |
 
 > ⚠️ **Deixe `sql_auth_enabled = false` neste primeiro momento.** Ele liga
@@ -195,6 +219,10 @@ que importa:
 - **o ACR aparece como `create`?** Então `acr_name` ficou vazio e ele vai criar um
   registry novo em vez de reusar o existente. Confirme com o Jefferson se é isso
   mesmo.
+- **o role_assignment `azurerm_role_assignment.acr_pull` aparece?** Se sim,
+  `acr_tenant_id` está vazio (padrão) — ACR será criado ou reutilizado no tenant
+  atual, e a autenticação é automática. Se o ACR é cross-tenant e o role assignment
+  **não** aparece, está correto: credenciais manuais são necessárias (Passo 1).
 
 ---
 

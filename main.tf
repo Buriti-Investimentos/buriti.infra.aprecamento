@@ -65,8 +65,16 @@ resource "azurerm_role_assignment" "kv_secrets_user" {
 # nativa -- resolve o mesmo problema sem os ~US$100/mes do Redis C1.
 
 # --- ACR: reusa o existente (recomendado) se informado ---
+provider "azurerm" {
+  alias = "acr_tenant"
+  subscription_id = var.acr_tenant_subscripton_id == "" ? var.subscription_id : var.acr_tenant_subscripton_id
+  tenant_id       = var.acr_tenant_id == "" ? data.azurerm_client_config.current.tenant_id : var.acr_tenant_id
+  features {}
+}
+
 data "azurerm_container_registry" "acr" {
   count               = var.acr_name != "" ? 1 : 0
+  provider            = azurerm.acr_tenant
   name                = var.acr_name
   resource_group_name = var.acr_resource_group_name
 }
@@ -86,6 +94,8 @@ locals {
 }
 
 resource "azurerm_role_assignment" "acr_pull" {
+  count                = var.acr_tenant_id == "" ? 1 : 0
+  provider             = azurerm
   scope                = local.acr_id
   role_definition_name = "AcrPull"
   principal_id         = azurerm_user_assigned_identity.this.principal_id

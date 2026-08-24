@@ -200,7 +200,7 @@ resource "azurerm_linux_function_app" "io" {
   })
 
   depends_on = [
-    azurerm_role_assignment.acr_pull,
+    azurerm_role_assignment.acr_pull[0],
     azurerm_role_assignment.kv_secrets_user,
     azurerm_role_assignment.st_blob,
     azurerm_role_assignment.st_queue,
@@ -256,7 +256,7 @@ resource "azurerm_linux_function_app" "calc" {
   })
 
   depends_on = [
-    azurerm_role_assignment.acr_pull,
+    azurerm_role_assignment.acr_pull[0],
     azurerm_role_assignment.st_blob,
     azurerm_role_assignment.st_queue,
     azurerm_role_assignment.st_table,
