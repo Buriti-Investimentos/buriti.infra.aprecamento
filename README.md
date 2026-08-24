@@ -187,7 +187,7 @@ sete informações, e **cinco delas vêm do Felipe**:
 | `functions_subnet_id` | Felipe — **só se** o SQL estiver atrás de rede privada; senão deixe vazio |
 | `acr_name` / `acr_resource_group_name` | Jefferson — reusar o registry existente evita criar outro |
 | `acr_tenant_id` | Felipe — **só se** o ACR estiver em outro tenant; senão deixe vazio (padrão = tenant atual) |
-| `acr_tenant_subscripton_id` | Felipe — **só se** o ACR estiver em outro tenant/subscription; senão deixe vazio (padrão = subscription atual) |
+| `acr_tenant_subscription_id` | Felipe — **só se** o ACR estiver em outro tenant/subscription; senão deixe vazio (padrão = subscription atual) |
 | `alert_emails` | vocês — **lista vazia não cria alerta nenhum** |
 
 > ⚠️ **Deixe `sql_auth_enabled = false` neste primeiro momento.** Ele liga
