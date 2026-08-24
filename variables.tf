@@ -118,7 +118,7 @@ variable "acr_name" {
   default     = ""
 }
 
-variable "acr_tenant_subscripton_id" {
+variable "acr_tenant_subscription_id" {
   type        = string
   description = "ID da subscription do tenant alternativo onde o ACR está localizado. Vazio = usa a subscription atual."
   default     = ""
