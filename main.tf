@@ -67,7 +67,7 @@ resource "azurerm_role_assignment" "kv_secrets_user" {
 # --- ACR: reusa o existente (recomendado) se informado ---
 provider "azurerm" {
   alias = "acr_tenant"
-  subscription_id = var.acr_tenant_subscripton_id == "" ? var.subscription_id : var.acr_tenant_subscripton_id
+  subscription_id = var.acr_tenant_subscription_id == "" ? var.subscription_id : var.acr_tenant_subscription_id
   tenant_id       = var.acr_tenant_id == "" ? data.azurerm_client_config.current.tenant_id : var.acr_tenant_id
   features {}
 }
