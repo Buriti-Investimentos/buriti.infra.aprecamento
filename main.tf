@@ -94,7 +94,7 @@ locals {
 }
 
 resource "azurerm_role_assignment" "acr_pull" {
-  count                = var.acr_tenant_id == "" ? 1 : 0
+  count                = var.acr_name != "" && var.acr_tenant_id != "" ? 0 : 1
   provider             = azurerm
   scope                = local.acr_id
   role_definition_name = "AcrPull"
