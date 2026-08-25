@@ -177,8 +177,18 @@ continua comentado — o state ainda é local.
 
 ### Passo 1 · Preencher os parâmetros do ambiente
 
-Abra `environments/dev.tfvars` e substitua todo `<ASSIM>` por valor real. São
-sete informações, e **cinco delas vêm do Felipe**:
+`environments/` é ignorado pelo git (`.gitignore`), então num clone limpo ele
+não existe — crie a partir do exemplo, que é a única fonte versionada de
+parâmetros:
+
+```bash
+mkdir -p environments
+cp terraform.tfvars.example environments/dev.tfvars
+```
+
+Agora abra `environments/dev.tfvars` e preencha. A tabela abaixo diz de onde
+vem cada informação — **não decore a quantidade**, ela muda a cada parâmetro
+novo:
 
 | Parâmetro | De onde vem |
 |---|---|
@@ -208,8 +218,8 @@ validação local antecipa: política de nomenclatura da empresa, região bloque
 permissão que falta na sua conta.
 
 São **23 blocos de recurso** declarados, mas o plan mostra mais linhas do que
-isso: `azurerm_storage_queue` vira 6 (as 3 filas + as 3 poison) e os 5 alertas só
-aparecem se `alert_emails` não estiver vazio. Não decore o número — confira o
+isso: `azurerm_storage_queue` vira 6 (as 3 filas + as 3 poison) e os **4 alertas mais
+o action group** só aparecem se `alert_emails` não estiver vazio. Não decore o número — confira o
 que importa:
 
 - **tudo com `+ create`.** Qualquer `~ update` ou `- destroy` no *primeiro* plan
@@ -220,10 +230,15 @@ que importa:
 - **o ACR aparece como `create`?** Então `acr_name` ficou vazio e ele vai criar um
   registry novo em vez de reusar o existente. Confirme com o Jefferson se é isso
   mesmo.
-- **o role_assignment `azurerm_role_assignment.acr_pull` aparece?** Se sim,
-  `acr_tenant_id` está vazio (padrão) — ACR será criado ou reutilizado no tenant
-  atual, e a autenticação é automática. Se o ACR é cross-tenant e o role assignment
-  **não** aparece, está correto: credenciais manuais são necessárias (Passo 1).
+- **o role_assignment `azurerm_role_assignment.acr_pull` aparece?** Ele só
+  **some** quando `acr_name` **e** `acr_tenant_id` estão os DOIS preenchidos —
+  é o `count` de `main.tf`. Some = ACR cross-tenant reusado, e aí a autenticação
+  do pull é por Service Principal (Passo 6), não por managed identity, porque
+  managed identity não atravessa tenant.
+  Se ele aparecer **com `acr_tenant_id` preenchido**, faltou o `acr_name`: seria
+  um registry novo e vazio no tenant da infra com as apps configuradas para o
+  outro tenant. Essa combinação é **barrada por `validation`** desde 25/08 e o
+  plan nem chega a rodar — a mensagem diz o que preencher.
 
 ---
 
@@ -283,40 +298,67 @@ cálculo acontece e a escrita falha na última etapa.
 
 ### Passo 6 · Segredos — **sql-auth (dev) e acr-credentials (cross-tenant)**
 
-#### SQL (dev apenas)
+São três, e **nenhum deles é escrito pelo Terraform**: um `value` de
+`azurerm_key_vault_secret` grava o segredo em texto claro no arquivo de state, e
+o state mora num storage account. Todos entram por um script só:
+
+```bash
+./scripts/subir-segredos.sh
+```
+
+Ele lê o nome do cofre do `terraform output`, pergunta cada segredo sem eco
+(ENTER em branco pula), grava, e **confere lendo de volta** — compara o SHA-256
+dos dois lados, o que prova que bateu sem imprimir o valor em lugar nenhum.
+Aceita `SQL_SERVER_USER`, `SQL_SERVER_PWD` e `ACR_CLIENT_SECRET` por variável de
+ambiente, para automação. É idempotente: rodar de novo é seguro.
+
+| segredo | quando é preciso | de onde vem |
+|---|---|---|
+| `sql-server-user` | só se `sql_auth_enabled = true` | Felipe |
+| `sql-server-pwd` | só se `sql_auth_enabled = true` | Felipe |
+| `acr-client-secret` | só se `acr_tenant_id` preenchido | Jefferson (o SP do ACR) |
+
+Antes de tentar gravar, o script confere se a sua conta enxerga o cofre. Escrever
+segredo é operação de **plano de dados**, e ser Owner da subscription **não** dá
+esse direito — é preciso o papel `Key Vault Secrets Officer` **no cofre**. Sem
+essa conferência o sintoma seria um 403 no meio da execução.
+
+> **Reiniciar as apps não é opcional.** A referência de cofre é resolvida quando
+> a app **inicia** — segredo gravado depois disso não chega sozinho numa app que
+> já está rodando. O script imprime os dois comandos de restart no fim, já com o
+> nome real das apps.
+
+#### A ordem do SQL é a armadilha clássica
 
 Em **produção não existe este passo**: a autenticação é AAD pela identidade
-gerenciada, sem senha nenhuma.
+gerenciada, sem senha nenhuma. Em **dev**, se o banco só aceitar usuário e senha:
+rode o script **primeiro**, e só então vire `sql_auth_enabled = true` no tfvars e
+rode `apply` de novo — é esse segundo apply que injeta nas Function Apps a
+*referência* aos segredos.
 
-Em **dev**, se o banco só aceitar usuário e senha, é aqui que eles entram — e
-entram **no cofre, nunca no Terraform**. Valor em variável de Terraform vira
-texto puro dentro do arquivo de state.
+> Se `sql_auth_enabled = true` já no primeiro apply, a app é criada apontando
+> para um segredo que não existe. A referência não resolve, a variável de conexão
+> chega vazia, e a app sobe sem conseguir falar com o banco — com um erro que
+> fala de conexão, não de cofre.
 
-```bash
-az keyvault secret set --vault-name <key_vault_name> \
-  --name sql-server-user --value '...'
-az keyvault secret set --vault-name <key_vault_name> \
-  --name sql-server-pwd  --value '...'
-```
+#### E o `acr-client-secret` tem de existir antes da primeira imagem
 
-**Só então** vire `sql_auth_enabled = true` no tfvars e rode `apply` de novo — é
-esse segundo apply que injeta nas Function Apps a *referência* aos segredos.
+Se `acr_tenant_id` foi preenchido, é esse segredo que autentica o **pull**. Ele
+precisa estar no cofre **antes do Passo 7**; senão as apps sobem, o ACR devolve
+401, e a tabela de sintomas mais abaixo manda procurar no lugar errado.
 
-> **A ordem aqui é a armadilha clássica.** Se `sql_auth_enabled = true` já no
-> primeiro apply, a app é criada apontando para um segredo que não existe. A
-> referência não resolve, a variável de conexão chega vazia, e a app sobe sem
-> conseguir falar com o banco — com um erro que fala de conexão, não de cofre.
-
-#### ACR cross-tenant (se aplicável)
-
-Se `acr_tenant_id` foi preenchido (ACR em outro tenant), você precisa guardar o
-`client_secret` do Service Principal no cofre **depois do primeiro apply** (o
-Terraform cria o secret vazio, pronto para receber):
-
-```bash
-az keyvault secret set --vault-name <key_vault_name> \
-  --name acr-client-secret --value '<client_secret_do_SP>'
-```
+> ⚠️ **Antes do `plan`, `az login` nos DOIS tenants.** O provider aliasado
+> (`azurerm.acr_tenant`) sobrescreve apenas `subscription_id` e `tenant_id`; a
+> credencial continua vindo do mesmo ambiente. Sem a subscription do ACR visível
+> no `az account list`, o erro cai na configuração do provider, **antes** de
+> qualquer recurso, e culpa o subscription id em vez de dizer que falta login:
+> `could not configure AzureCli Authorizer: the provided subscription ID "..." is not known by Azure CLI`.
+>
+> ```bash
+> az login --tenant <acr_tenant_id>       # tenant do ACR
+> az login --tenant <tenant_da_infra>     # onde a infra é criada
+> az account list -o table                # as DUAS têm de aparecer
+> ```
 
 Quem executa **todos esses segredos** (sql-server-pwd, sql-server-user,
 acr-client-secret) precisa da role **Key Vault Secrets Officer** no cofre.
@@ -409,6 +451,7 @@ Responde `202` com quantos pedidos entraram na fila. Datas passadas entram como
 | 7 | Remover o job antigo do scheduler do ETL no cutover | Felipe |
 | 8 | E-mails/canal dos alertas (vazio = **nenhum alerta é criado**) | Felipe/Jefferson |
 | 9 | Qual ACR reusar (candidato: `fundsapiservice-ceahbnb9h8atcybj`) | Jefferson |
+| 10 | **Testar `storage_shared_key_enabled = false`** — o host e o código só usam managed identity, mas desligar a chave em Function App conteinerizada no plano Elastic Premium não pôde ser testado sem acesso Azure. Vire `false`, confira que as 2 apps sobem e a fila consome, e deixe `false`. | quem fizer o 1º apply |
 
 ---
 
@@ -418,6 +461,28 @@ O `compute.tf` anterior modelava **2 Container App Jobs** (cron diário +
 backfill manual). Era coeso, mas não era a arquitetura combinada com o cliente.
 Foi arquivado em `docs/superseded/compute.container-app-job.tf.txt` — vale como
 referência, não como alvo.
+
+### Revisão de 23/08/2026 — 9 defeitos
+
+O mais grave: **`APP_MODE` não era setado por este Terraform**. O código liga a autenticação
+AAD da managed identity só quando `app_mode == "production"` (`config.py:121/238`) — e o
+default é `"development"`. Com `sql_auth_enabled = false` (o padrão de prod), a app subia
+**sem senha e sem token**, e a falha aparecia como erro de login, mandando depurar os grants
+do banco em vez do app setting que faltava. Provado rodando o `ServiceSettings` real com as
+variáveis exatas que este arquivo entregava.
+
+Os outros oito: `CALC_TIMEZONE` (a variável `timezone` não chegava ao cálculo, só ao fuso do
+SO); `SQL_TRUST_SERVER_CERTIFICATE` no default `"yes"` (cifrava sem validar o certificado);
+o comentário que dizia "sem chave compartilhada" sem desligá-la; o alerta de silêncio que
+filtrava sem agregar (consulta sem linhas não tem o que agregar — não dispararia); `has` com
+frase de duas palavras no alerta de poison; o Key Vault sem `soft_delete_retention_days`
+(`destroy`+`apply` travado 90 dias pelo nome reservado); "5 alertas" onde são 4 mais o action
+group; e o custo do EP1 anunciado como conta quando é o preço de uma instância.
+
+Relatório completo, com o que foi conferido e estava certo: `docs/campanha-ui/82-REVISAO-TERRAFORM-APRECAMENTO.md`
+no repositório de documentação.
+
+---
 
 Junto vieram duas correções que valem registrar:
 

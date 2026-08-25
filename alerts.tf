@@ -83,15 +83,23 @@ resource "azurerm_monitor_scheduled_query_rules_alert_v2" "batch_silencio" {
   window_duration      = "P1D"
   tags                 = local.tags
 
-  # Ausencia: 0 linhas no resultado -> dispara.
+  # Ausencia. A consulta TERMINA em summarize de proposito: uma consulta que
+  # so filtra devolve ZERO LINHAS no caso que queremos detectar, e regra de log
+  # sem linha nenhuma nao tem o que agregar -- o alerta simplesmente nao
+  # avalia. Com o summarize a consulta devolve SEMPRE uma linha, com a
+  # contagem 0 dentro, e o "0 == 0" tem como acontecer.
+  # (Mesma familia do defeito que este arquivo ja corrigiu uma vez: alerta que
+  # nunca dispara e pior que alerta nenhum.)
   criteria {
     query                   = <<-QUERY
       traces
       | extend ev = parse_json(message)
       | where tostring(ev.evento) == "calc.batch.completed"
+      | summarize Lotes = count()
     QUERY
-    time_aggregation_method = "Count"
-    operator                = "Equal"
+    time_aggregation_method = "Total"
+    metric_measure_column   = "Lotes"
+    operator                = "LessThanOrEqual"
     threshold               = 0
   }
 
@@ -124,7 +132,7 @@ resource "azurerm_monitor_scheduled_query_rules_alert_v2" "mensagem_envenenada" 
   criteria {
     query                   = <<-QUERY
       traces
-      | where message has "poison" and message has "moving message"
+      | where message contains "poison" and message contains "moving message"
     QUERY
     time_aggregation_method = "Count"
     operator                = "GreaterThan"
