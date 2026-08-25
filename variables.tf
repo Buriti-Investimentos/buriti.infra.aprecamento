@@ -86,6 +86,29 @@ variable "sql_auth_enabled" {
   default     = false
 }
 
+variable "sql_trust_server_certificate" {
+  type        = string
+  description = <<-DESC
+    "no" (default) = valida o certificado do servidor, que e o correto para
+    Azure SQL. "yes" aceita qualquer certificado -- so use se o nome do host
+    nao casar com o certificado. O default do CODIGO e "yes"; aqui o Terraform
+    o sobrescreve de proposito.
+  DESC
+  default     = "no"
+}
+
+variable "storage_shared_key_enabled" {
+  type        = bool
+  description = <<-DESC
+    Mantem a chave compartilhada da conta de storage habilitada. Default true.
+    O host e o codigo autenticam por managed identity e nao usam a chave -- mas
+    desliga-la em Function App CONTEINERIZADA no plano Elastic Premium ainda
+    nao foi testado por nos (sem acesso Azure). Virar false e conferir se as
+    duas apps sobem e a fila consome; se subirem, deixar false.
+  DESC
+  default     = true
+}
+
 variable "timezone" {
   type        = string
   description = "Timezone dos jobs (data alvo do batch)."
@@ -120,14 +143,41 @@ variable "acr_name" {
 
 variable "acr_tenant_subscription_id" {
   type        = string
-  description = "ID da subscription do tenant alternativo onde o ACR está localizado. Vazio = usa a subscription atual."
+  description = "ID da subscription do tenant alternativo onde o ACR está localizado. Vazio = usa a subscription atual. Anda SEMPRE junto com acr_tenant_id."
   default     = ""
+
+  # UMA SUBSCRIPTION PERTENCE A EXATAMENTE UM TENANT, entao preencher so' um dos
+  # dois e' uma configuracao impossivel -- e o Terraform nao percebia: o provider
+  # aliasado monta `tenant_id` e `subscription_id` de forma independente e cai em
+  # `var.subscription_id` quando este aqui esta vazio. O resultado e' pegar token
+  # no tenant do ACR e procurar o registry numa subscription da Buriti.
+  #
+  # Medido com ACR real, variando SO' a subscription:
+  #   coerente   -> "Read complete", login_server devolvido
+  #   incoerente -> "Planning failed ... Registry (Subscription: ...) was not found"
+  # A mensagem fala do NOME do registry quando a causa e' a subscription, e
+  # ninguem aponta para a variavel esquecida. Dai a validacao.
+  validation {
+    condition     = (var.acr_tenant_id == "") == (var.acr_tenant_subscription_id == "")
+    error_message = "acr_tenant_id e acr_tenant_subscription_id andam juntos: uma subscription pertence a exatamente um tenant. Preencha os dois, ou nenhum."
+  }
 }
 
 variable "acr_tenant_id" {
   type        = string
   description = "Tenant ID do outro Azure tenant onde o ACR está localizado. Vazio = usa o tenant atual."
   default     = ""
+
+  # O QUARTO QUADRANTE, que nao esta na tabela de cenarios do README e nao
+  # deveria existir: `acr_tenant_id` preenchido com `acr_name` VAZIO. Medido:
+  # o plan passa e produz um hibrido incoerente -- cria um registry novo e
+  # vazio no NOSSO tenant, poe AcrPull nele, e ainda configura as duas apps
+  # com usuario e senha de um service principal do tenant do outro. A app
+  # sobe apontando para um registry que nao tem imagem nenhuma.
+  validation {
+    condition     = var.acr_tenant_id == "" || var.acr_name != ""
+    error_message = "acr_tenant_id so faz sentido reusando um ACR existente: preencha acr_name (e acr_resource_group_name) ou deixe acr_tenant_id vazio para criar um registry local."
+  }
 }
 
 variable "acr_client_id" {
@@ -144,7 +194,13 @@ variable "functions_sku" {
     SKU do plano. EP1 (default) = Elastic Premium: e o unico que roda CONTAINER
     proprio -- necessario porque o pyodbc exige o ODBC Driver 18, que e pacote de
     sistema e nao entra em plano gerenciado -- e o unico que integra em VNet, caso
-    o SQL esteja atras de private endpoint. Custo ~US$150/mes por ambiente.
+    o SQL esteja atras de private endpoint.
+
+    CUSTO: ~US$150/mes e o preco de UMA instancia EP1 -- e um PISO, nao a conta.
+    O plano cobra por instancia alocada, e aqui duas apps o dividem: a "-io"
+    fica com uma instancia sempre pronta (elastic_instance_minimum = 1) e a
+    "-calc" escala ate calc_scale_limit durante o lote. Conferir na primeira
+    fatura antes de prometer numero a alguem.
   DESC
   default     = "EP1"
 }

@@ -41,7 +41,7 @@ resource "azurerm_user_assigned_identity" "this" {
 # --- Key Vault (segredos que não têm managed identity) ---
 # Secrets esperados (doc 12 §5.2): sql-server-user / sql-server-pwd (SÓ dev;
 # prod = AAD sem senha). Os VALORES entram
-# fora do Terraform (az keyvault secret set — README §Secrets) para não vazarem
+# fora do Terraform (scripts/subir-segredos.sh — README, Passo 6) para não vazarem
 # no state; os jobs referenciam por URI (compute.tf). Quem seta precisa da role
 # "Key Vault Secrets Officer" no KV (RBAC).
 resource "azurerm_key_vault" "this" {
@@ -51,6 +51,14 @@ resource "azurerm_key_vault" "this" {
   tenant_id                  = data.azurerm_client_config.current.tenant_id
   sku_name                   = "standard"
   rbac_authorization_enabled = true
+
+  # Sem isto o cofre nasce com 90 dias de soft-delete: um `destroy` seguido de
+  # `apply` falha porque o NOME fica reservado pelo cofre apagado, e a mensagem
+  # nao diz isso. 7 e o minimo permitido, e este ambiente e recriavel.
+  # Em prod, subir para 90 e ligar purge_protection quando o cofre passar a
+  # guardar segredo que nao pode ser perdido.
+  soft_delete_retention_days = 7
+  purge_protection_enabled   = false
   tags                       = local.tags
 }
 
@@ -101,18 +109,25 @@ resource "azurerm_role_assignment" "acr_pull" {
   principal_id         = azurerm_user_assigned_identity.this.principal_id
 }
 
-# ACR cross-tenant: credenciais no Key Vault (Client Secret não entra direto em variable por segurança).
-# Manual: az keyvault secret set --vault-name <kv-name> --name acr-client-secret --value '<secret>'
-resource "azurerm_key_vault_secret" "acr_client_id" {
-  count        = var.acr_tenant_id != "" ? 1 : 0
-  name         = "acr-client-id"
-  value        = var.acr_client_id
-  key_vault_id = azurerm_key_vault.this.id
-}
-
-resource "azurerm_role_assignment" "kv_acr_secret_reader" {
-  count                = var.acr_tenant_id != "" ? 1 : 0
-  scope                = azurerm_key_vault.this.id
-  role_definition_name = "Key Vault Secrets User"
-  principal_id         = azurerm_user_assigned_identity.this.principal_id
-}
+# ACR cross-tenant: o Client Secret NAO entra em `variable` -- segredo em
+# variable vira texto puro no state. Ele e' gravado a mao, uma vez:
+#   ./scripts/subir-segredos.sh    (grava e CONFERE os tres segredos do cofre)
+#
+# ⚠️ DOIS RECURSOS SAIRAM DAQUI EM 25/08/2026, e cada um tinha um motivo.
+#
+# `azurerm_key_vault_secret.acr_client_id` -- gravava no cofre justamente o que
+# NAO e' segredo (o client id ja viaja em texto claro no app setting e no
+# tfvars) e ninguem lia de volta. Pior: era a unica escrita de DATA PLANE do
+# repositorio inteiro, num cofre RBAC puro, e nenhum role assignment daqui
+# concede papel de dados a quem roda o terraform -- Owner de subscription NAO
+# cobre (`az role definition list --name Owner` devolve `dataActions: []`). O
+# apply tomaria 403 no meio.
+#
+# `azurerm_role_assignment.kv_acr_secret_reader` -- era argumento por argumento
+# identico ao `kv_secrets_user` (acima): mesmo escopo, mesma role
+# "Key Vault Secrets User", mesmo principal. Nenhum dos dois fixa `name`, entao
+# saem dois GUIDs distintos para a MESMA tripla e o ARM devolve 409
+# `RoleAssignmentExists`. O provider azurerm 4.79 nao tolera esse erro (a string
+# nao existe no binario dele, enquanto `RoleAssignmentDoesNotExist` existe): o
+# 409 sobe cru e derruba o apply. O `kv_secrets_user` ja concede exatamente essa
+# role, a esse principal, nesse cofre, em todos os cenarios.
