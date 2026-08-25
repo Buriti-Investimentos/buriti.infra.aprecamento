@@ -24,7 +24,13 @@
 # ---------------------------------------------------------------------------
 # Storage: runtime do host + as 3 filas + os blobs do claim-check
 # ---------------------------------------------------------------------------
-# Sem chave compartilhada: tudo por managed identity, igual ao resto da casa.
+# O host e o codigo acessam por managed identity (nao ha connection string em
+# lugar nenhum). A CHAVE compartilhada da conta, porem, continua existindo: o
+# comentario anterior dizia "sem chave compartilhada" e isso nao era verdade --
+# `shared_access_key_enabled` fica em variavel, default `true`, porque
+# desliga-la em Function App conteinerizada precisa de um teste de subida que
+# ainda nao pudemos fazer (sem acesso Azure). Ver README, "O que ainda depende
+# de terceiros".
 resource "azurerm_storage_account" "func" {
   name                            = "st${substr(replace(local.name, "-", ""), 0, 20)}"
   resource_group_name             = azurerm_resource_group.this.name
@@ -33,6 +39,7 @@ resource "azurerm_storage_account" "func" {
   account_replication_type        = "LRS"
   min_tls_version                 = "TLS1_2"
   https_traffic_only_enabled      = true
+  shared_access_key_enabled       = var.storage_shared_key_enabled
   allow_nested_items_to_be_public = false
   tags                            = local.tags
 }
@@ -129,8 +136,37 @@ locals {
     "APPLICATIONINSIGHTS_CONNECTION_STRING" = azurerm_application_insights.this.connection_string
     "AZURE_CLIENT_ID"                       = azurerm_user_assigned_identity.this.client_id
     "APP_ENV"                               = var.environment
-    "TZ"                                    = var.timezone
     "FUNCTIONS_WORKER_RUNTIME"              = "python"
+
+    # APP_MODE decide COMO a conexao autentica -- e nao e cosmetico:
+    # `config.py:238` registra o token AAD da managed identity SO quando
+    # `app_mode == "production"`, e `sqlalchemy_url()` (config.py:176) so omite
+    # usuario/senha nesse mesmo caso. Sem esta linha o default do codigo e
+    # "development": em prod a app subia sem token E sem senha, e a conexao
+    # falhava com erro de credencial. Deriva de `sql_auth_enabled` porque e a
+    # MESMA decisao ("AAD sem senha" x "usuario e senha") -- nao do nome do
+    # ambiente, senao um dev com AAD ou um prod com senha autentica errado.
+    "APP_MODE" = var.sql_auth_enabled ? "development" : "production"
+
+    # Duas coisas diferentes com o mesmo valor: `TZ` e o fuso do SISTEMA
+    # (carimbo de log, `date` do container); `CALC_TIMEZONE` e o que o servico
+    # de fato le (config.py:151) para decidir a data-alvo do lote. Antes so o
+    # primeiro era setado, e a variavel `timezone` do Terraform nao chegava ao
+    # calculo -- funcionava por coincidencia, porque o default do codigo e o
+    # mesmo "America/Sao_Paulo".
+    # TRES coisas diferentes com o mesmo valor, e cada uma governa uma peca:
+    #   TZ ................. fuso do SISTEMA (carimbo de log, `date` do container)
+    #   CALC_TIMEZONE ...... o que o SERVICO le (config.py:151) para decidir a
+    #                        data-alvo do lote
+    #   WEBSITE_TIME_ZONE .. o fuso que o RUNTIME do Functions usa para
+    #                        interpretar o NCRONTAB do timer_trigger. Sem ele o
+    #                        cron e lido em UTC: "0 0 21 * * *" dispararia as
+    #                        18h de Brasilia, tres horas antes do combinado --
+    #                        e antes do ETL de posicoes do dia.
+    # Setar so TZ nao resolve nenhuma das duas ultimas.
+    "TZ"                = var.timezone
+    "CALC_TIMEZONE"     = var.timezone
+    "WEBSITE_TIME_ZONE" = var.timezone
   })
 
   # Conexao com o SQL — SO na app "-io". Host/porta/base nao sao segredo
@@ -141,6 +177,14 @@ locals {
       "SQL_SERVER_PORT" = tostring(var.sql_server_port)
       "SQL_SERVER_DB"   = var.sql_server_db
       "CALC_POOL_SIZE"  = tostring(var.calc_pool_size)
+
+      # O default do codigo e "yes", que ACEITA qualquer certificado -- com
+      # ODBC 18 a conexao continua cifrada, mas deixa de validar quem esta do
+      # outro lado. O Azure SQL apresenta certificado valido para
+      # *.database.windows.net (inclusive por private endpoint), entao o certo
+      # aqui e "no". Fica em variavel para o Felipe poder relaxar em um
+      # cenario de nome que nao casa, sem editar codigo.
+      "SQL_TRUST_SERVER_CERTIFICATE" = var.sql_trust_server_certificate
     },
     var.sql_auth_enabled ? {
       "SQL_SERVER_USER" = "@Microsoft.KeyVault(SecretUri=${azurerm_key_vault.this.vault_uri}secrets/sql-server-user)"
@@ -174,6 +218,18 @@ resource "azurerm_linux_function_app" "io" {
     type         = "UserAssigned"
     identity_ids = [azurerm_user_assigned_identity.this.id]
   }
+  # ⚠️ SEM ESTA LINHA, NENHUMA REFERENCIA DE COFRE RESOLVE -- 25/08/2026.
+  # O App Service resolve `@Microsoft.KeyVault(SecretUri=...)` com a identidade
+  # SYSTEM-assigned por padrao, e estas apps nao tem uma: so' a user-assigned
+  # acima. Quando nao resolve, a Azure entrega o app setting com a STRING CRUA,
+  # e o sintoma aparece longe da causa -- erro de credencial no SQL mandando
+  # procurar no banco, ou 401 no pull mandando procurar no registry.
+  # Medido: 29 de 29 App Services de uma subscription reportam
+  # `keyVaultReferenceIdentity = "SystemAssigned"` mesmo com `identity.type`
+  # nulo -- nao existe fallback para "adota a unica identidade que houver".
+  # A permissao ja esta certa (`kv_secrets_user` da "Key Vault Secrets User" a
+  # esta mesma identidade); o que faltava era DIZER a app qual identidade usar.
+  key_vault_reference_identity_id = azurerm_user_assigned_identity.this.id
 
   site_config {
     # Teto DURO de instancias: as etapas 1 e 3 sao "1 conexao cada". Com 1
@@ -238,6 +294,10 @@ resource "azurerm_linux_function_app" "calc" {
     type         = "UserAssigned"
     identity_ids = [azurerm_user_assigned_identity.this.id]
   }
+  # Mesma razao da app `-io`, acima: sem isto o app setting chega com a string
+  # crua. Vale para esta tambem porque a credencial do registry cross-tenant e
+  # uma referencia de cofre, e e' ela que autentica o pull da imagem.
+  key_vault_reference_identity_id = azurerm_user_assigned_identity.this.id
 
   site_config {
     app_scale_limit                               = var.calc_scale_limit
@@ -267,6 +327,13 @@ resource "azurerm_linux_function_app" "calc" {
     azurerm_role_assignment.st_blob,
     azurerm_role_assignment.st_queue,
     azurerm_role_assignment.st_table,
+    # A `calc` passou a LER o cofre -- a credencial do registry cross-tenant e
+    # uma referencia de Key Vault, como as do SQL na `-io`. Sem esta aresta a
+    # app pode nascer antes de a identidade ter permissao de leitura.
+    # (`depends_on` nao tem ordem: fica no FIM de proposito, para nao encostar
+    # na linha do `acr_pull` -- que o PR #3 tambem edita, e duas edicoes na
+    # mesma linha viram conflito de merge na vespera do deploy.)
+    azurerm_role_assignment.kv_secrets_user,
   ]
 
   lifecycle {
