@@ -8,6 +8,24 @@ location        = "brazilsouth"
 acr_name                = ""
 acr_resource_group_name = ""
 
+# ACR em OUTRO tenant — o registry centralizado da Buriti, onde o ETL da base já
+# publica. Os TRÊS vazios = registry no mesmo tenant da infra (o padrão de hoje).
+#
+# Preenchidos, mudam o caminho de autenticação do PULL: a managed identity não
+# atravessa tenant, então as apps passam a usar usuário e senha de um Service
+# Principal. Isso exige, fora do Terraform:
+#   1. um SP criado no tenant do ACR, com role AcrPull no registry (Jefferson);
+#   2. o segredo dele gravado à mão no cofre — o Terraform NÃO cria este:
+#      ./scripts/subir-segredos.sh  (grava e confere os tres segredos do cofre)
+#   3. `az login` nos DOIS tenants antes do plan (as duas subscriptions têm de
+#      aparecer em `az account list`), senão o provider aliasado não configura.
+#
+# acr_tenant_id e acr_tenant_subscription_id ANDAM JUNTOS — há validação: uma
+# subscription pertence a exatamente um tenant.
+acr_tenant_id              = ""
+acr_tenant_subscription_id = ""
+acr_client_id              = ""
+
 # Imagem publicada pelo CI. UMA imagem serve as 2 Function Apps.
 image_name = "buriti-aprecamento"
 image_tag  = "latest"
@@ -27,6 +45,15 @@ sql_server_host  = "servidor.database.windows.net"
 sql_server_db    = "BURITI_DW"
 calc_pool_size   = 5
 sql_auth_enabled = false
+
+# "no" valida o certificado do servidor (correto para Azure SQL). O default do
+# CÓDIGO é "yes", que aceita qualquer certificado — o Terraform sobrescreve.
+sql_trust_server_certificate = "no"
+
+# A chave compartilhada do storage. O host autentica por managed identity e não
+# usa a chave, mas desligá-la em Function App conteinerizada ainda não foi
+# testado (item 10 do README). Virar false e conferir se as 2 apps sobem.
+storage_shared_key_enabled = true
 
 # Rede: vazio = SQL público com firewall. Preencher só se for private endpoint
 # (subnet DELEGADA a Microsoft.Web/serverFarms).
