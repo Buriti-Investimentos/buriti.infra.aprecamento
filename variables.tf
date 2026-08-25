@@ -118,6 +118,24 @@ variable "acr_name" {
   default     = ""
 }
 
+variable "acr_tenant_subscription_id" {
+  type        = string
+  description = "ID da subscription do tenant alternativo onde o ACR está localizado. Vazio = usa a subscription atual."
+  default     = ""
+}
+
+variable "acr_tenant_id" {
+  type        = string
+  description = "Tenant ID do outro Azure tenant onde o ACR está localizado. Vazio = usa o tenant atual."
+  default     = ""
+}
+
+variable "acr_client_id" {
+  type        = string
+  description = "Client ID do Service Principal para autenticar no ACR cross-tenant. Obrigatório apenas se acr_tenant_id for preenchido."
+  default     = ""
+}
+
 
 # --- Functions (Pacote 12-R) ---
 variable "functions_sku" {

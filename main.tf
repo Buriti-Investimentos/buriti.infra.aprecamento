@@ -65,8 +65,16 @@ resource "azurerm_role_assignment" "kv_secrets_user" {
 # nativa -- resolve o mesmo problema sem os ~US$100/mes do Redis C1.
 
 # --- ACR: reusa o existente (recomendado) se informado ---
+provider "azurerm" {
+  alias = "acr_tenant"
+  subscription_id = var.acr_tenant_subscription_id == "" ? var.subscription_id : var.acr_tenant_subscription_id
+  tenant_id       = var.acr_tenant_id == "" ? data.azurerm_client_config.current.tenant_id : var.acr_tenant_id
+  features {}
+}
+
 data "azurerm_container_registry" "acr" {
   count               = var.acr_name != "" ? 1 : 0
+  provider            = azurerm.acr_tenant
   name                = var.acr_name
   resource_group_name = var.acr_resource_group_name
 }
@@ -86,7 +94,25 @@ locals {
 }
 
 resource "azurerm_role_assignment" "acr_pull" {
+  count                = var.acr_name != "" && var.acr_tenant_id != "" ? 0 : 1
+  provider             = azurerm
   scope                = local.acr_id
   role_definition_name = "AcrPull"
+  principal_id         = azurerm_user_assigned_identity.this.principal_id
+}
+
+# ACR cross-tenant: credenciais no Key Vault (Client Secret não entra direto em variable por segurança).
+# Manual: az keyvault secret set --vault-name <kv-name> --name acr-client-secret --value '<secret>'
+resource "azurerm_key_vault_secret" "acr_client_id" {
+  count        = var.acr_tenant_id != "" ? 1 : 0
+  name         = "acr-client-id"
+  value        = var.acr_client_id
+  key_vault_id = azurerm_key_vault.this.id
+}
+
+resource "azurerm_role_assignment" "kv_acr_secret_reader" {
+  count                = var.acr_tenant_id != "" ? 1 : 0
+  scope                = azurerm_key_vault.this.id
+  role_definition_name = "Key Vault Secrets User"
   principal_id         = azurerm_user_assigned_identity.this.principal_id
 }
