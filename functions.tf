@@ -104,13 +104,33 @@ resource "azurerm_role_assignment" "st_table" {
 # Plano gerenciado so aceita wheels Python -> exigiria trocar o driver e perder a
 # autenticacao AAD sem senha, que e o padrao ja provado no ETL. Premium tambem e
 # o unico que entra na VNet, caso o SQL esteja atras de private endpoint.
+locals {
+  # `maximum_elastic_worker_count`, `elastic_instance_minimum` e
+  # `app_scale_limit` SO existem em Elastic Premium. Num plano dedicado
+  # (P1v3/S1/B*) o apply falha. Sem esta chave, trocar o SKU nao sobe.
+  plano_elastico = can(regex("^EP", var.functions_sku))
+}
+
 resource "azurerm_service_plan" "func" {
-  name                         = "asp-${local.name}"
-  resource_group_name          = azurerm_resource_group.this.name
-  location                     = azurerm_resource_group.this.location
-  os_type                      = "Linux"
-  sku_name                     = var.functions_sku
-  maximum_elastic_worker_count = var.functions_max_workers
+  name                = "asp-${local.name}"
+  resource_group_name = azurerm_resource_group.this.name
+  location            = azurerm_resource_group.this.location
+  os_type             = "Linux"
+  sku_name            = var.functions_sku
+  # Num plano dedicado quem manda no paralelismo e `worker_count`, e ele vale
+  # para o PLANO, nao por app. Doc oficial (App Service plans, atualizada em
+  # 31/08/2026), ao pe da letra: "When the app runs, it runs on ALL the VM
+  # instances configured in the App Service plan" e "All apps in an App Service
+  # plan scale together". Ou seja, com 2 a `-io` teria DOIS gravadores e o teto
+  # de uma transacao por vez cairia sem aviso.
+  #
+  # Existe `per-app scaling` para limitar uma app a um subconjunto das
+  # instancias, e o plano ate expoe `per_site_scaling_enabled` -- mas o provider
+  # NAO expoe a contagem por app no `azurerm_linux_function_app`, entao isso
+  # exigiria `azapi` ou passo manual. Por isso 1, que e correto sem depender de
+  # nada fora do terraform.
+  maximum_elastic_worker_count = local.plano_elastico ? var.functions_max_workers : null
+  worker_count                 = local.plano_elastico ? null : var.functions_workers_dedicado
   tags                         = local.tags
 }
 
@@ -235,8 +255,17 @@ resource "azurerm_linux_function_app" "io" {
     # Teto DURO de instancias: as etapas 1 e 3 sao "1 conexao cada". Com 1
     # instancia + batchSize 1 (app setting abaixo), o banco ve UMA transacao por
     # vez, por construcao.
-    app_scale_limit                               = 1
-    elastic_instance_minimum                      = 1
+    app_scale_limit          = local.plano_elastico ? 1 : null
+    elastic_instance_minimum = local.plano_elastico ? 1 : null
+    # Doc oficial (Dedicated hosting, atualizada em 02/03/2026): "On an App
+    # Service plan, the Functions runtime goes idle after a few minutes of
+    # inactivity. The Always on setting is available ONLY on an App Service
+    # plan. In other plans, the platform activates function apps
+    # automatically." Sem ele, o gatilho de TIMER para de disparar e o job das
+    # 21h nao roda -- sem erro nenhum. E o timeout ilimitado no dedicado tambem
+    # depende dele. No Elastic Premium quem mantem quente e o
+    # `elastic_instance_minimum`; la `always_on` nao se aplica, por isso null.
+    always_on                                     = local.plano_elastico ? null : true
     vnet_route_all_enabled                        = var.functions_subnet_id != ""
     container_registry_use_managed_identity       = var.acr_tenant_id == "" ? true : false
     container_registry_managed_identity_client_id = var.acr_tenant_id == "" ? azurerm_user_assigned_identity.this.client_id : null
@@ -300,7 +329,8 @@ resource "azurerm_linux_function_app" "calc" {
   key_vault_reference_identity_id = azurerm_user_assigned_identity.this.id
 
   site_config {
-    app_scale_limit                               = var.calc_scale_limit
+    app_scale_limit                               = local.plano_elastico ? var.calc_scale_limit : null
+    always_on                                     = local.plano_elastico ? null : true
     container_registry_use_managed_identity       = var.acr_tenant_id == "" ? true : false
     container_registry_managed_identity_client_id = var.acr_tenant_id == "" ? azurerm_user_assigned_identity.this.client_id : null
 

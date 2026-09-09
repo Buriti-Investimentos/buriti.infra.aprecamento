@@ -241,3 +241,21 @@ variable "max_dequeue_count" {
   DESC
   default     = 5
 }
+
+variable "functions_workers_dedicado" {
+  type        = number
+  description = <<-DESC
+    Instancias do plano quando o SKU NAO e Elastic Premium (P1v3, S1, B*).
+
+    DEFAULT 1, e mexer nisso tem consequencia: em App Service dedicado TODA app
+    roda em TODAS as instancias do plano. Com 2, a app `-io` passa a ter dois
+    GRAVADORES simultaneos e o teto de uma transacao por vez no SQL cai -- que
+    e o requisito nº1 do Felipe. Subir daqui exige antes tirar a decisao de
+    `versao_calculo` do caminho por-ativo.
+
+    Custo de deixar em 1: a calculadora tambem fica com uma instancia. Para o
+    volume medido em 09/09 (maior fundo = 33 mil ativos, lote inteiro em ~10 s)
+    isso e irrelevante.
+  DESC
+  default     = 1
+}
